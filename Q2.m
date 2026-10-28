@@ -63,11 +63,9 @@ clear; clc;
 % Definition used in Link Simulations>.
 simParameters = struct();       % Clear simParameters variable to contain all key simulation parameters 
 simParameters.NFrames = 10;      % Number of 10 ms frames
-simParameters.SNRIn = [-10 -9 -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5]; % SNR range (dB)
+simParameters.SNRIn = [-20 -19 -18 -17 -16 -15 -14 -13 -12 -11 -10 -9 -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6]; % SNR range (dB)
 
 numSNRPoints  = numel(simParameters.SNRIn);
-simThroughput = zeros(numSNRPoints,1);
-maxThroughput = zeros(numSNRPoints,1);
 
 %% GPU Acceleration
 % When your simulation runs on a very large data set, using a GPU can
@@ -173,7 +171,24 @@ simParameters.PDSCH.NumLayers = 2;            % Number of PDSCH transmission lay
 % Define codeword modulation and target coding rate
 % The number of codewords is directly dependent on the number of layers so ensure that 
 % layers are set first before getting the codeword number
-modulation = "16QAM";
+modulationlist = ["QPSK" "16QAM" "64QAM" "256QAM"];
+
+% One figure per metric, with explicit axes so nothing plots in the wrong figure
+figLat = figure; axLat = axes(figLat); hold(axLat,"on");
+figThr = figure; axThr = axes(figThr); hold(axThr,"on");
+
+% Storage for saving all modulations
+latencyAll    = nan(numSNRPoints,numel(modulationlist));
+throughputAll = nan(numSNRPoints,numel(modulationlist));   % Mbps
+throughputPct = nan(numSNRPoints,numel(modulationlist));   % %
+
+for index = 1:numel(modulationlist)
+    simThroughput = zeros(numSNRPoints,1);
+    maxThroughput = zeros(numSNRPoints,1);
+    simLatencyMs  = zeros(numSNRPoints,1);
+    numLatencyEvents = zeros(numSNRPoints,1);
+    modulation = modulationlist(index);
+    modulation = modulationlist(index);
 if simParameters.PDSCH.NumCodewords > 1                             % Multicodeword transmission (when number of layers being > 4)
     simParameters.PDSCH.Modulation = {modulation,modulation};             % "QPSK", "16QAM", "64QAM", "256QAM"
     simParameters.PDSCHExtension.TargetCodeRate = [490 490]/1024;   % Code rate used to calculate transport block sizes
@@ -181,6 +196,7 @@ else
     simParameters.PDSCH.Modulation = modulation;                       % "QPSK", "16QAM", "64QAM", "256QAM"
     simParameters.PDSCHExtension.TargetCodeRate = 490/1024;         % Code rate used to calculate transport block sizes
 end
+
 
 % DM-RS and antenna port configuration (TS 38.211 Section 7.4.1.1)
 simParameters.PDSCH.DMRS.DMRSTypeAPosition = 2;      % Mapping type A only. First DM-RS symbol position (2,3)
@@ -666,24 +682,23 @@ for snrIdx = 1:numSNRPoints      % comment out for parallel computing
 end
 
 
-
 %% Results
-% Plot average latency versus SNR
-
 avgLatencyMs = simLatencyMs ./ max(numLatencyEvents,1);
 avgLatencyMs(numLatencyEvents == 0) = NaN;
 
-figure;
-plot(simParameters.SNRIn(1:numel(avgLatencyMs(:))), avgLatencyMs(:), "o-.")
+throughputMbps = 1e-6*simThroughput./(simParameters.NFrames*10e-3);
 
-xlabel("SNR (dB)");
-ylabel("Average latency (ms)");
-grid on;
-title(sprintf("%s (%dx%d) / NRB=%d / SCS=%dkHz", ...
-    simParameters.DelayProfile,simParameters.NTxAnts,simParameters.NRxAnts, ...
-    simParameters.Carrier.NSizeGrid,simParameters.Carrier.SubcarrierSpacing));
+% Store for saving later
+latencyAll(:,index)    = avgLatencyMs;
+throughputAll(:,index) = throughputMbps;
+throughputPct(:,index) = 100*simThroughput./maxThroughput;
 
-% Bundle key parameters and results into a combined structure for recording
+% Latency plot
+plot(axLat,simParameters.SNRIn,avgLatencyMs,"o-.","DisplayName",modulation);
+
+% Throughput plot
+plot(axThr,simParameters.SNRIn,throughputMbps,"o-.","DisplayName",modulation);
+
 simResults = struct();
 simResults.simParameters = simParameters;
 simResults.simThroughput = simThroughput;
@@ -691,6 +706,8 @@ simResults.maxThroughput = maxThroughput;
 simResults.rxAntennaSNR = rxAntennaSNR;
 
 summaryTable = processResults(simResults);
+end   % end of modulation loop
+
 
 %%
 % Display a table that contains the measured throughput and SNR. The SNRIn
@@ -701,29 +718,48 @@ summaryTable = processResults(simResults);
 % the SNR definition that this example uses, see
 % <docid:5g_ug#mw_37cef3ca-2f4b-433d-8d68-117a881ca5fd SNR Definition Used
 % in Link Simulations>.
+titleStr = sprintf("%s (%dx%d) / NRB=%d / SCS=%dkHz", ...
+    simParameters.DelayProfile,simParameters.NTxAnts,simParameters.NRxAnts, ...
+    simParameters.Carrier.NSizeGrid,simParameters.Carrier.SubcarrierSpacing);
 
-disp(summaryTable);
+% Format latency plot
+hold(axLat,"off");
+xlabel(axLat,"SNR (dB)"); ylabel(axLat,"Average latency (ms)");
+grid(axLat,"on"); title(axLat,titleStr); legend(axLat,"Location","best");
 
-% Raw data
-if ~exist('Q2img','dir'), mkdir('Q2img'); end
+% Format throughput plot
+hold(axThr,"off");
+xlabel(axThr,"SNR (dB)"); ylabel(axThr,"Throughput (Mbps)");
+grid(axThr,"on"); title(axThr,titleStr); legend(axThr,"Location","best");
+
+disp(summaryTable);   % summary of the last modulation (256QAM)
+
+%% Save plots and data
+if ~exist('Q2img','dir'),  mkdir('Q2img');  end
 if ~exist('Q2data','dir'), mkdir('Q2data'); end
-plotData = table(simParameters.SNRIn(:), avgLatencyMs(:), ...
-    'VariableNames', {'SNRdB','LatencyMs'});
-save('latencyData.mat', 'plotData', 'simParameters', 'simResults');
 
+% Editable figures
+savefig(figLat,'Q2img/latencyPlot.fig');
+savefig(figThr,'Q2img/throughputPlot.fig');
 
-writetable(plotData, 'Q2data/latencyData.csv');
+% Images
+exportgraphics(figLat,'Q2img/latencyPlot.png','Resolution',300);
+exportgraphics(figThr,'Q2img/throughputPlot.png','Resolution',300);
+
+% Raw data (one column per modulation)
+snr = simParameters.SNRIn(:);
+latencyTbl = array2table([snr latencyAll], ...
+    'VariableNames',["SNRdB" "Latency_"+modulationlist]);
+throughputTbl = array2table([snr throughputAll throughputPct], ...
+    'VariableNames',["SNRdB" "Throughput_Mbps_"+modulationlist "Throughput_pct_"+modulationlist]);
+
+writetable(latencyTbl,'Q2data/latencyData.csv');
+writetable(throughputTbl,'Q2data/throughputData.csv');
+save('Q2data/simData.mat','latencyTbl','throughputTbl','simParameters');
 
 % Plot image
-fig = figure;
-plot(plotData.SNRdB, plotData.LatencyMs, 'o-.')
-xlabel('SNR (dB)')
-ylabel('Average latency (ms)')
-grid on
-exportgraphics(fig, 'latencyPlot.png', 'Resolution', 300)
-
 % Optional: save editable figure
-savefig(fig, 'Q2img/latencyPlot.fig')
+%savefig(fig, 'Q2img/latencyPlot.fig')
 
 
 %%

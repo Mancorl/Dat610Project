@@ -1,968 +1,346 @@
-%% NR PDSCH Throughput 
-% This reference simulation shows how to measure the physical downlink
-% shared channel (PDSCH) throughput of a 5G New Radio (NR) link, as defined
-% by the 3GPP NR standard. The example implements the PDSCH and downlink
-% shared channel (DL-SCH). The transmitter model includes PDSCH
-% demodulation reference signals (DM-RS) and PDSCH phase tracking reference
-% signals (PT-RS). The example supports both clustered delay line (CDL) and
-% tapped delay line (TDL) propagation channels. You can perform perfect or
-% practical synchronization and channel estimation. To reduce the total
-% simulation time, you can use Parallel Computing Toolbox(TM) to execute 
-% the SNR points in the SNR loop in parallel and use a compatible
-% graphics processing unit (GPU) device for data-intensive computation.
-% Copyright 2017-2026 The MathWorks, Inc.
-
-%% Introduction
-% This example measures the PDSCH throughput of a 5G link, as defined by
-% the 3GPP NR standards TS 38.211, TS 38.212, TS 38.213, and TS 38.214.
-% 
-% The example models these 5G NR features:
-% 
-% * DL-SCH transport channel coding
-% * Multiple codewords, dependent on the number of layers
-% * PDSCH, PDSCH DM-RS, and PDSCH PT-RS generation
-% * Variable subcarrier spacing and frame numerologies (2^n * 15 kHz)
-% * Normal and extended cyclic prefix
-% * TDL and CDL propagation channel models
-% 
-% Other features of the simulation are:
-% 
-% * PDSCH subband precoding using SVD
-% * CP-OFDM modulation
-% * Slot wise and non slot wise PDSCH and DM-RS mapping
-% * Perfect or practical synchronization and channel estimation
-% * HARQ operation with 16 processes
-% * The example uses a single bandwidth part across the whole carrier
-% 
-% The figure shows the implemented processing chain. For clarity, the 
-% DM-RS and PT-RS generation are omitted.
-% 
-% <<../PDSCHLinkExampleProcessingChain.png>>
+%% Q2: How do retransmissions and the latency budget affect reliability?
+% Based on the MathWorks "NR PDSCH Throughput" example [5], reconfigured to
+% use the SAME link as Q1, Q3 and Q4 (Table I):
+%   3.5 GHz (n78), 30 kHz SCS, 51 RB (20 MHz), 1x1 antennas, 1 layer,
+%   R = 490/1024, 12 LDPC iterations (normalized min-sum), 16 HARQ
+%   processes, 3 km/h, TDL-C 300 ns (urban) / TDL-D 30 ns (rural),
+%   perfect channel estimation (as in Q3), 100 frames per SNR point.
 %
-% For a more detailed explanation of the steps implemented in this example,
-% see <docid:5g_gs#mw_b41487f2-4e53-412e-83ff-b77bd3984819 Model 5G NR
-% Communication Links> and
-% <docid:5g_gs#mw_5441cb0f-86ed-4038-8735-d0a50ea68f60 DL-SCH and PDSCH
-% Transmit and Receive Processing Chain>.
+% Swept here: modulation (QPSK, 16QAM, 64QAM, 256QAM) inside this script,
+% and, from Q2_runall.m, the maximum number of transmissions
+% Q2_NTX in {1,2,4,8} and the environment Q2_ENV in {"urban","rural"}.
 %
-% This example supports both wideband and subband precoding. The precoding
-% matrix is determined using SVD by averaging the channel estimate across
-% all PDSCH PRBs in the allocation (wideband case) or in the subband.
-% 
-% To reduce the total simulation time, you can use the Parallel Computing
-% Toolbox to execute the SNR points of the SNR loop in parallel.
+% Requires the helper files shipped with the MathWorks example
+% (HARQEntity.m, hSVDPrecoders.m, hSkipWeakTimingOffset.m) on the path.
 
-%% Simulation Length and SNR Points
-% Set the length of the simulation in terms of the number of 10ms frames. A
-% large number of NFrames should be used to produce meaningful throughput
-% results. Set the SNR points to simulate. The SNR for each layer is
-% defined per RE, and it includes the effect of signal and noise across all
-% antennas. For an explanation of the SNR definition that this example
-% uses, see <docid:5g_ug#mw_37cef3ca-2f4b-433d-8d68-117a881ca5fd SNR
-% Definition used in Link Simulations>.
-simParameters = struct();       % Clear simParameters variable to contain all key simulation parameters 
-simParameters.NFrames = 100;      % Number of 10 ms frames
-simParameters.SNRIn = -20:2:30; % SNR range (dB)
+%% Sweep parameters (set by Q2_runall.m, defaults for a single run)
+if ~exist("Q2_NTX","var"), Q2_NTX = 4;       end   % max transmissions per TB
+if ~exist("Q2_ENV","var"), Q2_ENV = "urban"; end   % "urban" or "rural"
 
-numSNRPoints  = numel(simParameters.SNRIn);
-
-%% GPU Acceleration
-% When your simulation runs on a very large data set, using a GPU can
-% accelerate the overall simulation time by performing the data-intensive 
-% part of the computation on the GPU. Use the |UseGPU| flag to control the 
-% use of a GPU in the simulation. When set to |"off"|, the simulation runs 
-% on the CPU. When set to |"on"|, the simulation uses a GPU (requires 
-% Parallel Computing Toolbox(TM)). When set to |"auto"|, the simulation 
-% automatically uses a GPU device if a compatible GPU device is available. 
+%% Simulation length and SNR points
+simParameters = struct();
+simParameters.NFrames = 100;        % 100 x 10 ms frames = 2000 slots per point
+% 1x1 has no array gain, so the range is wider than Table I (0-16 dB) in
+% order to take QPSK to 0 % and 256-QAM to 100 % throughput.
+simParameters.SNRIn   = -10:2:30;   % dB
+numSNRPoints = numel(simParameters.SNRIn);
 
 simParameters.UseGPU = "auto";
-
-%% Channel Estimator Configuration
-% The logical variable |PerfectChannelEstimator| controls channel
-% estimation and synchronization behavior. When set to |true|, perfect
-% channel estimation and synchronization is used. Otherwise, practical
-% channel estimation and synchronization is used, based on the values of
-% the received PDSCH DM-RS.
-
-simParameters.PerfectChannelEstimator = true;
-
-%% Simulation Diagnostics
-% The variable |DisplaySimulationInformation| controls the display of
-% simulation information such as the HARQ process ID used for each
-% subframe. In case of CRC error, the value of the index to the RV sequence
-% is also displayed.
+simParameters.PerfectChannelEstimator = true;    % same as Q3 (decoding chain only)
 simParameters.DisplaySimulationInformation = false;
-%%
-% The |DisplayDiagnostics| flag enables the plotting of the EVM per layer.
-% This plot monitors the quality of the received signal after equalization.
-% The EVM per layer figure shows:
-%
-% * The EVM per layer per slot, which shows the EVM evolving with time.
-% * The EVM per layer per resource block, which shows the EVM in frequency.
-%
-% This figure evolves with the simulation and is updated with each slot. 
-% Typically, low SNR or channel fades can result in decreased signal 
-% quality (high EVM). The channel affects each layer differently,
-% therefore, the EVM values may differ across layers.
-%
-% In some cases, some layers can have a much higher EVM than others. These
-% low-quality layers can result in CRC errors. This behavior may be caused
-% by low SNR or by using too many layers for the channel conditions. You
-% can avoid this situation by a combination of higher SNR, lower number
-% of layers, higher number of antennas, and more robust transmission 
-% (lower modulation scheme and target code rate).
 
-simParameters.DisplayDiagnostics = false;
+%% Carrier (Table I)
+simParameters.Carrier = nrCarrierConfig;
+simParameters.Carrier.NSizeGrid = 51;            % 51 RB = 20 MHz at 30 kHz
+simParameters.Carrier.SubcarrierSpacing = 30;    % 0.5 ms slot
+simParameters.Carrier.CyclicPrefix = "Normal";
+simParameters.Carrier.NCellID = 1;
 
-%% Carrier and PDSCH Configuration
-% Set the key parameters of the simulation. These include:
-% 
-% * The bandwidth in resource blocks (12 subcarriers per resource block).
-% * Subcarrier spacing: 15, 30, 60, 120 (kHz)
-% * Cyclic prefix length: normal or extended
-% * Cell ID
-% * Number of transmit and receive antennas
-% 
-% A substructure containing the DL-SCH and PDSCH parameters is also
-% specified. This includes:
-% 
-% * Target code rate
-% * Allocated resource blocks (PRBSet)
-% * Modulation scheme: "QPSK", "16QAM", "64QAM", "256QAM"
-% * Number of layers
-% * PDSCH mapping type
-% * DM-RS configuration parameters
-% * PT-RS configuration parameters
-% 
-% Other simulation wide parameters are:
-% 
-% * Propagation channel model delay profile (TDL or CDL)
-
-% Set waveform type and PDSCH numerology (SCS and CP type)
-simParameters.Carrier = nrCarrierConfig;         % Carrier resource grid configuration
-simParameters.Carrier.NSizeGrid = 51;            % Bandwidth in number of resource blocks (51 RBs at 30 kHz SCS for 20 MHz BW)
-simParameters.Carrier.SubcarrierSpacing = 30;    % 15, 30, 60, 120 (kHz)
-simParameters.Carrier.CyclicPrefix = "Normal";   % "Normal" or "Extended" (Extended CP is relevant for 60 kHz SCS only)
-simParameters.Carrier.NCellID = 1;               % Cell identity
-
-% PDSCH/DL-SCH parameters
-simParameters.PDSCH = nrPDSCHConfig;      % This PDSCH definition is the basis for all PDSCH transmissions in the BLER simulation
-simParameters.PDSCHExtension = struct();  % This structure is to hold additional simulation parameters for the DL-SCH and PDSCH
-
-% Define PDSCH time-frequency resource allocation per slot to be full grid (single full grid BWP)
-simParameters.PDSCH.PRBSet = 0:simParameters.Carrier.NSizeGrid-1;                 % PDSCH PRB allocation
-simParameters.PDSCH.SymbolAllocation = [0,simParameters.Carrier.SymbolsPerSlot];  % Starting symbol and number of symbols of each PDSCH allocation
-simParameters.PDSCH.MappingType = "A";     % PDSCH mapping type ("A"(slot-wise),"B"(non slot-wise))
-
-% Scrambling identifiers
-simParameters.PDSCH.NID = simParameters.Carrier.NCellID;
+%% PDSCH / DL-SCH (Table I)
+simParameters.PDSCH = nrPDSCHConfig;
+simParameters.PDSCHExtension = struct();
+simParameters.PDSCH.PRBSet = 0:simParameters.Carrier.NSizeGrid-1;
+simParameters.PDSCH.SymbolAllocation = [0, simParameters.Carrier.SymbolsPerSlot];
+simParameters.PDSCH.MappingType = "A";
+simParameters.PDSCH.NID  = simParameters.Carrier.NCellID;
 simParameters.PDSCH.RNTI = 1;
-
-% PDSCH resource block mapping (TS 38.211 Section 7.3.1.6)
-simParameters.PDSCH.VRBToPRBInterleaving = 0; % Disable interleaved resource mapping
+simParameters.PDSCH.VRBToPRBInterleaving = 0;
 simParameters.PDSCH.VRBBundleSize = 4;
+simParameters.PDSCH.NumLayers = 1;               % 1 layer (was 2)
 
-% Define the number of transmission layers to be used
-simParameters.PDSCH.NumLayers = 2;            % Number of PDSCH transmission layers
+% DM-RS (reference-example defaults, unchanged)
+simParameters.PDSCH.DMRS.DMRSTypeAPosition = 2;
+simParameters.PDSCH.DMRS.DMRSLength = 1;
+simParameters.PDSCH.DMRS.DMRSAdditionalPosition = 2;
+simParameters.PDSCH.DMRS.DMRSConfigurationType = 2;
+simParameters.PDSCH.DMRS.NumCDMGroupsWithoutData = 1;
+simParameters.PDSCH.DMRS.NIDNSCID = 1;
+simParameters.PDSCH.DMRS.NSCID = 0;
+simParameters.PDSCH.DMRS.DMRSPortSet = [];
 
-% Define codeword modulation and target coding rate
-% The number of codewords is directly dependent on the number of layers so ensure that 
-% layers are set first before getting the codeword number
-modulationlist = ["QPSK" "16QAM" "64QAM" "256QAM"];
+simParameters.PDSCH.EnablePTRS = 0;              % PT-RS off
+simParameters.PDSCH.ReservedPRB{1}.SymbolSet = [];
+simParameters.PDSCH.ReservedPRB{1}.PRBSet = [];
+simParameters.PDSCH.ReservedPRB{1}.Period = [];
 
-% One figure per metric, with explicit axes so nothing plots in the wrong figure
-figLat = figure; axLat = axes(figLat); hold(axLat,"on");
-figThr = figure; axThr = axes(figThr); hold(axThr,"on");
-
-% Storage for saving all modulations
-latencyAll    = nan(numSNRPoints,numel(modulationlist));
-throughputAll = nan(numSNRPoints,numel(modulationlist));   % Mbps
-throughputPct = nan(numSNRPoints,numel(modulationlist));   % %
-residualAll = nan(numSNRPoints,numel(modulationlist));
-avgTxAll    = nan(numSNRPoints,numel(modulationlist));
-
-for index = 1:numel(modulationlist)
-    simThroughput = zeros(numSNRPoints,1);
-    maxThroughput = zeros(numSNRPoints,1);
-    simLatencyMs  = zeros(numSNRPoints,1);
-    numLatencyEvents = zeros(numSNRPoints,1);
-    modulation = modulationlist(index);
-    modulation = modulationlist(index);
-if simParameters.PDSCH.NumCodewords > 1                             % Multicodeword transmission (when number of layers being > 4)
-    simParameters.PDSCH.Modulation = {modulation,modulation};             % "QPSK", "16QAM", "64QAM", "256QAM"
-    simParameters.PDSCHExtension.TargetCodeRate = [490 490]/1024;   % Code rate used to calculate transport block sizes
-else
-    simParameters.PDSCH.Modulation = modulation;                       % "QPSK", "16QAM", "64QAM", "256QAM"
-    simParameters.PDSCHExtension.TargetCodeRate = 490/1024;         % Code rate used to calculate transport block sizes
-end
-
-
-% DM-RS and antenna port configuration (TS 38.211 Section 7.4.1.1)
-simParameters.PDSCH.DMRS.DMRSTypeAPosition = 2;      % Mapping type A only. First DM-RS symbol position (2,3)
-simParameters.PDSCH.DMRS.DMRSLength = 1;             % Number of front-loaded DM-RS symbols (1(single symbol),2(double symbol))
-simParameters.PDSCH.DMRS.DMRSAdditionalPosition = 2; % Additional DM-RS symbol positions (max range 0...3)
-simParameters.PDSCH.DMRS.DMRSConfigurationType = 2;  % DM-RS configuration type (1,2)
-simParameters.PDSCH.DMRS.NumCDMGroupsWithoutData = 1;% Number of CDM groups without data
-simParameters.PDSCH.DMRS.NIDNSCID = 1;               % Scrambling identity (0...65535)
-simParameters.PDSCH.DMRS.NSCID = 0;                  % Scrambling initialization (0,1)
-simParameters.PDSCH.DMRS.DMRSPortSet = [];           % Use this to specify explicit DM-RS port numbers (TS 38.212 Section 7.3.1.2). Empty corresponds to the first NumLayers valid ports
-
-% PT-RS configuration (TS 38.211 Section 7.4.1.2)
-simParameters.PDSCH.EnablePTRS = 0;                  % Enable or disable PT-RS (1 or 0)
-simParameters.PDSCH.PTRS.TimeDensity = 1;            % PT-RS time density (L_PT-RS) (1, 2, 4)
-simParameters.PDSCH.PTRS.FrequencyDensity = 2;       % PT-RS frequency density (K_PT-RS) (2 or 4)
-simParameters.PDSCH.PTRS.REOffset = "00";            % PT-RS resource element offset ("00", "01", "10", "11")
-simParameters.PDSCH.PTRS.PTRSPortSet = [];           % PT-RS antenna port, subset of DM-RS port set. Empty corresponds to lower DM-RS port number
-
-% Reserved PRB patterns, if required (for CORESETs, forward compatibility etc)
-simParameters.PDSCH.ReservedPRB{1}.SymbolSet = [];   % Reserved PDSCH symbols
-simParameters.PDSCH.ReservedPRB{1}.PRBSet = [];      % Reserved PDSCH PRBs
-simParameters.PDSCH.ReservedPRB{1}.Period = [];      % Periodicity of reserved resources
-
-% Additional simulation and DL-SCH related parameters
-%
-% PDSCH PRB bundling (TS 38.214 Section 5.1.2.3)
-simParameters.PDSCHExtension.PRGBundleSize = [];     % 2, 4, or [] to signify "wideband"
-%
-% HARQ process and rate matching/TBS parameters
-simParameters.PDSCHExtension.XOverhead = 6*simParameters.PDSCH.EnablePTRS; % Set PDSCH rate matching overhead for TBS (Xoh) to 6 when PT-RS is enabled, otherwise 0
-simParameters.PDSCHExtension.NHARQProcesses = 16;    % Number of parallel HARQ processes to use
-simParameters.PDSCHExtension.EnableHARQ = true;      % Enable retransmissions for each process, using RV sequence [0,2,3,1]
-simParameters.PDSCHExtension.EnableCBGTransmission = false; % Enable CBG-based transmission, otherwise TB-based transmission
-simParameters.PDSCHExtension.MaxNumCBG = 4;          % Maximum number of CBGs per transport block for each HARQ process in CBG-based transmission
-
-% LDPC decoder parameters
-% Available algorithms: "Belief propagation", "Layered belief propagation", "Normalized min-sum", "Offset min-sum"
+simParameters.PDSCHExtension.TargetCodeRate = 490/1024;
+simParameters.PDSCHExtension.PRGBundleSize = [];
+simParameters.PDSCHExtension.XOverhead = 0;
+simParameters.PDSCHExtension.NHARQProcesses = 16;
+simParameters.PDSCHExtension.EnableCBGTransmission = false;
 simParameters.PDSCHExtension.LDPCDecodingAlgorithm = "Normalized min-sum";
 simParameters.PDSCHExtension.MaximumLDPCIterationCount = 12;
 
-% Define the overall transmission antenna geometry at end-points
-% If using a CDL propagation channel then the integer number of antenna elements is
-% turned into an antenna panel configured when the channel model object is created
-simParameters.NTxAnts = 8;                        % Number of PDSCH transmission antennas (1,2,4,8,16,32,64,128,256,512,1024) >= NumLayers
-if simParameters.PDSCH.NumCodewords > 1           % Multi-codeword transmission
-    simParameters.NRxAnts = 8;                    % Number of UE receive antennas (even number >= NumLayers)
-else
-    simParameters.NRxAnts = 2;                    % Number of UE receive antennas (1 or even number >= NumLayers)
-end
-
-% Define data type ("single" or "double") for resource grids and waveforms
+%% Antennas and channel (Table I)
+simParameters.NTxAnts = 1;                       % 1x1 (was 8x2 with SVD precoding)
+simParameters.NRxAnts = 1;
 simParameters.DataType = "single";
 
-% Define the general CDL or TDL propagation channel parameters.
-% If you later want to debug unexpected simulation results, set DelayProfile to
-% "None" to disable channel impairments due to mobility, fading, multipath,
-% delay, and antenna effects.
-simParameters.DelayProfile = "CDL-C"; % "CDL-A", ..., "CDL-E", "TDL-A", ..., "TDL-E", "None"
-simParameters.DelaySpread = 300e-9;
-simParameters.MaximumDopplerShift = 5;
+simParameters.CarrierFrequency = 3.5e9;          % Hz, band n78
+simParameters.UESpeedKmh = 3;                    % pedestrian, as Q1 and Q3
+c = physconst("LightSpeed");
+simParameters.MaximumDopplerShift = (simParameters.UESpeedKmh/3.6) * ...
+    simParameters.CarrierFrequency / c;          % ~9.7 Hz
 
-% Cross-check the PDSCH layering against the channel geometry 
-validateNumLayers(simParameters);
+switch lower(Q2_ENV)
+    case "urban"                                 % NLOS
+        simParameters.DelayProfile = "TDL-C";
+        simParameters.DelaySpread  = 300e-9;
+    case "rural"                                 % LOS
+        simParameters.DelayProfile = "TDL-D";
+        simParameters.DelaySpread  = 30e-9;
+    otherwise
+        error("Q2_ENV must be ""urban"" or ""rural"".");
+end
 
-%% 
-% The simulation relies on various pieces of information about the baseband 
-% waveform, such as sample rate.
-
-waveformInfo = nrOFDMInfo(simParameters.Carrier); % Get information about the baseband waveform after OFDM modulation step
-
-%% Propagation Channel Model Construction
-% Create the channel model object for the simulation. The example supports both the CDL and TDL channel 
-% models, as defined in TR 38.901.
-
-[channel,simParameters] = createChannel(simParameters,waveformInfo);
-
-%% 
-% Get the maximum number of delayed samples by a channel multipath
-% component. This is calculated from the channel path with the largest
-% delay and the implementation delay of the channel filter. This is
-% required later to flush the channel filter to obtain the received signal.
-
+waveformInfo = nrOFDMInfo(simParameters.Carrier);
+[channel, simParameters] = createChannel(simParameters, waveformInfo);
 chInfo = info(channel);
 maxChDelay = chInfo.MaximumChannelDelay;
 
-%%
-% Create a prototype of the transport block based on simParameters.UseGPU 
 if simParameters.UseGPU == "on" || (simParameters.UseGPU == "auto" && canUseGPU)
-    device = gpuDevice().Name;
-    fprintf("\nUsing GPU device %s for computation\n",device);
     simParameters.Prototype = zeros(0,0,"gpuArray");
 else
     simParameters.Prototype = zeros(0,0);
 end
 
-%% Processing Loop
-% To determine the throughput at each SNR point, analyze the PDSCH data 
-% per transmission instance using the following steps:
-% 
-% * _Update current HARQ process._ Check the transmission status for the
-% given HARQ process to determine whether a retransmission is required. If
-% that is not the case then generate new data.
-% * _Resource grid generation._ Perform channel coding by calling the
-% <docid:5g_ref#mw_sysobj_nrDLSCH nrDLSCH> System object. The object
-% operates on the input transport block and keeps an internal copy of the
-% transport block in case a retransmission is required. Modulate the coded
-% bits on the PDSCH by using the <docid:5g_ref#mw_function_nrPDSCH nrPDSCH>
-% function. Then apply precoding to the resulting signal.
-% * _Waveform generation._ OFDM modulate the generated grid.
-% * _Noisy channel modeling._ Pass the waveform through a CDL or TDL
-% fading channel. Add AWGN. For an explanation of the SNR definition that
-% this example uses, see
-% <docid:5g_ug#mw_37cef3ca-2f4b-433d-8d68-117a881ca5fd SNR Definition Used
-% in Link Simulations>.
-% * _Perform synchronization and OFDM demodulation._ For perfect
-% synchronization, reconstruct the channel impulse response to synchronize
-% the received waveform. For practical synchronization, correlate the
-% received waveform with the PDSCH DM-RS. Then OFDM demodulate the
-% synchronized signal.
-% * _Perform channel estimation._ For perfect channel estimation,
-% reconstruct the channel impulse response and perform OFDM demodulation.
-% For practical channel estimation, use the PDSCH DM-RS.
-% * _Perform equalization and CPE compensation._ MMSE equalize the
-% estimated channel. Estimate the common phase error (CPE) by using the
-% PT-RS symbols, then correct the error in each OFDM symbol within the
-% range of reference PT-RS OFDM symbols.
-% * _Precoding matrix calculation._ Generate the precoding matrix W for the
-% next transmission by using singular value decomposition (SVD).
-% * _Decode the PDSCH._ To obtain an estimate of the received codewords,
-% demodulate and descramble the recovered PDSCH symbols for all transmit
-% and receive antenna pairs, along with a noise estimate, by using the
-% <docid:5g_ref#mw_function_nrPDSCHDecode nrPDSCHDecode> function.
-% * _Decode the downlink shared channel (DL-SCH) and update HARQ process
-% with the block CRC error._ Pass the vector of decoded soft bits to the
-% <docid:5g_ref#mw_sysobj_nrDLSCHDecoder nrDLSCHDecoder> System object. The
-% object decodes the codeword and returns the block CRC error used to
-% determine the throughput of the system.
-
-% Array to store the latency for all SNR points
-simLatencyMs = zeros(numSNRPoints,1);
-numLatencyEvents = zeros(numSNRPoints,1);
-
-% Slot duration in milliseconds
-slotDurationMs = 1 / simParameters.Carrier.SlotsPerSubframe;
-
-% Array to store measured SNR for all SNR points
-rxAntennaSNR = zeros(numSNRPoints,1);
-
-residualBLER = zeros(numSNRPoints,1);   % blocks lost after all allowed transmissions / finished blocks
-avgTx = zeros(numSNRPoints,1);          % average transmissions per delivered block
-
-% Set up redundancy version (RV) sequence for all HARQ processes
-% In Q2 script: replace the if/else that sets rvSeq
+%% HARQ / latency budget
+% Ntx is set by truncating or repeating the RV sequence [0 2 3 1].
+% Ntx = 1 means HARQ off (a failed block is dropped after one attempt).
 baseRV = [0 2 3 1];
-rvSeq  = baseRV(mod(0:Q2_NTX-1, 4) + 1);   % Q2_NTX = max number of transmissions
+rvSeq  = baseRV(mod(0:Q2_NTX-1, 4) + 1);
 simParameters.PDSCHExtension.EnableHARQ = (Q2_NTX > 1);
+maxNumCBG = 1;                                   % TB-based transmission
 
-% Set up maximum number of CBGs in retransmissions
-if simParameters.PDSCHExtension.EnableCBGTransmission
-    maxNumCBG = 5;
-else
-    maxNumCBG = 1;
-end
+slotDurationMs = 1 / simParameters.Carrier.SlotsPerSubframe;   % 0.5 ms
 
-% Create DL-SCH encoder system object to perform transport channel encoding
-encodeDLSCH = nrDLSCH;
-encodeDLSCH.MultipleHARQProcesses = true;
-encodeDLSCH.CBGTransmission = true;
-encodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
+%% Storage (one column per modulation)
+modulationlist = ["QPSK" "16QAM" "64QAM" "256QAM"];
+nMod = numel(modulationlist);
+latencyAll    = nan(numSNRPoints, nMod);   % mean latency of delivered blocks (ms)
+throughputAll = nan(numSNRPoints, nMod);   % Mbit/s (goodput, CRC-passed TB bits)
+throughputPct = nan(numSNRPoints, nMod);   % % of maximum
+residualAll   = nan(numSNRPoints, nMod);   % share of blocks lost after Ntx attempts
+avgTxAll      = nan(numSNRPoints, nMod);   % mean transmissions per delivered block
 
-% Create DL-SCH decoder system object to perform transport channel decoding
-decodeDLSCH = nrDLSCHDecoder;
-decodeDLSCH.MultipleHARQProcesses = true;
-decodeDLSCH.CBGTransmission = true;
-decodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
-decodeDLSCH.LDPCDecodingAlgorithm = simParameters.PDSCHExtension.LDPCDecodingAlgorithm;
-decodeDLSCH.MaximumLDPCIterationCount = simParameters.PDSCHExtension.MaximumLDPCIterationCount;
+figLat = figure; axLat = axes(figLat); hold(axLat,"on");
+figThr = figure; axThr = axes(figThr); hold(axThr,"on");
 
-for snrIdx = 1:numSNRPoints      % comment out for parallel computing
-% parfor snrIdx = 1:numSNRPoints % uncomment for parallel computing
-% To reduce the total simulation time, you can execute this loop in
-% parallel by using the Parallel Computing Toolbox. Comment out the 'for'
-% statement and uncomment the 'parfor' statement. If the Parallel Computing
-% Toolbox is not installed, 'parfor' defaults to normal 'for' statement.
-% Because parfor-loop iterations are executed in parallel in a
-% nondeterministic order, the simulation information displayed for each SNR
-% point can be intertwined. To switch off simulation information display,
-% set the 'displaySimulationInformation' variable above to false
+%% Modulation loop
+for mIdx = 1:nMod
+    modulation = modulationlist(mIdx);
+    simParameters.PDSCH.Modulation = modulation;
 
-    % Reset the random number generator so that each SNR point will
-    % experience the same noise realization
-    rng("default");
-    
-    % Take full copies of the simulation-level parameter structures so that they are not 
-    % PCT broadcast variables when using parfor 
-    simLocal = simParameters;
-    waveinfoLocal = waveformInfo;
-    
-    % Take copies of channel-level parameters to simplify subsequent parameter referencing 
-    carrier = simLocal.Carrier;
-    pdsch = simLocal.PDSCH;
-    pdschextra = simLocal.PDSCHExtension;
-    decodeDLSCHLocal = decodeDLSCH;  % Copy of the decoder handle to help PCT classification of variable
-    decodeDLSCHLocal.reset(); 
-    txStartSlot = nan(pdsch.NumCodewords,pdschextra.NHARQProcesses);
+    % DL-SCH encoder / decoder
+    encodeDLSCH = nrDLSCH;
+    encodeDLSCH.MultipleHARQProcesses = true;
+    encodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
 
-    % Prepare simulation for new SNR point
-    SNRdB = simLocal.SNRIn(snrIdx);
-    fprintf("\nSimulating transmission scheme 1 (%dx%d) and SCS=%dkHz with %s channel at %gdB SNR for %d 10ms frame(s)\n", ...
-        simLocal.NTxAnts,simLocal.NRxAnts,carrier.SubcarrierSpacing, ...
-        simLocal.DelayProfile,SNRdB,simLocal.NFrames);
-    
-    % Specify the fixed order in which we cycle through the HARQ process IDs
-    harqSequence = 0:pdschextra.NHARQProcesses-1;
+    decodeDLSCH = nrDLSCHDecoder;
+    decodeDLSCH.MultipleHARQProcesses = true;
+    decodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
+    decodeDLSCH.LDPCDecodingAlgorithm = simParameters.PDSCHExtension.LDPCDecodingAlgorithm;
+    decodeDLSCH.MaximumLDPCIterationCount = simParameters.PDSCHExtension.MaximumLDPCIterationCount;
 
-    % Initialize the state of all HARQ processes
-    harqEntity = HARQEntity(harqSequence,rvSeq,pdsch.NumCodewords,maxNumCBG);
-    txCount = zeros(pdsch.NumCodewords, pdschextra.NHARQProcesses);
-    nDelivered = 0; nLost = 0; sumTxDelivered = 0;
-    % Reset the channel so that each SNR point will experience the same
-    % channel realization
-    reset(channel);
-    
-    % Total number of slots in the simulation period
-    NSlots = simLocal.NFrames * carrier.SlotsPerFrame;
-    
-    % Obtain a precoding matrix (wtx) to be used in the transmission of the
-    % first transport block
-    estChannelGridAnts = getInitialChannelEstimate(carrier,channel,simLocal.DataType,maxChDelay);
-    newWtx = hSVDPrecoders(carrier,pdsch,estChannelGridAnts,pdschextra.PRGBundleSize);
-    
-    % Timing offset, updated in every slot for perfect synchronization and
-    % when the correlation is strong for practical synchronization
-    offset = 0;
+    simThroughput = zeros(numSNRPoints,1);
+    maxThroughput = zeros(numSNRPoints,1);
+    sumLatencyMs  = zeros(numSNRPoints,1);
+    nDeliveredAll = zeros(numSNRPoints,1);
+    residualBLER  = nan(numSNRPoints,1);
+    avgTx         = nan(numSNRPoints,1);
 
-    % Noise power, normalized by the IFFT size used in OFDM modulation, as
-    % the OFDM modulator applies this normalization to the transmitted
-    % waveform. Also normalize by the number of receive antennas, as the
-    % channel model applies this normalization to the received waveform by
-    % default
-    SNR = 10^(SNRdB/10);
-    N0 = 1/sqrt(simLocal.NRxAnts*waveinfoLocal.Nfft*SNR);
-    nVar = N0^2*waveinfoLocal.Nfft;
+    for snrIdx = 1:numSNRPoints
+        rng("default");                      % same noise for every point
+        reset(channel);                      % same fading for every point
+        decodeDLSCH.reset();
 
-    % Initialize variables to store power measurements
-    rxSigPower = zeros(NSlots,1);
+        carrier    = simParameters.Carrier;
+        pdsch      = simParameters.PDSCH;
+        pdschextra = simParameters.PDSCHExtension;
+        SNRdB      = simParameters.SNRIn(snrIdx);
 
-    % Loop over the entire waveform length
-    for nslot = 0:NSlots-1
-        
-        % Update the carrier slot numbers for new slot
-        carrier.NSlot = nslot;
-                
-        % Calculate the transport block sizes for the transmission in the slot
-        [pdschIndices,pdschIndicesInfo] = nrPDSCHIndices(carrier,pdsch);
-        trBlkSizes = nrTBS(pdsch.Modulation,pdsch.NumLayers,numel(pdsch.PRBSet),pdschIndicesInfo.NREPerPRB,pdschextra.TargetCodeRate,pdschextra.XOverhead);
+        fprintf("%s, Ntx=%d, %s, %g dB\n", Q2_ENV, Q2_NTX, modulation, SNRdB);
 
-        % HARQ processing
-        for cwIdx = 1:pdsch.NumCodewords
-            % If new data for current process and codeword then create a new DL-SCH transport block
-            if harqEntity.NewData(cwIdx)
-                if harqEntity.NewData(cwIdx)
-                    trBlk = randi([0 1],trBlkSizes(cwIdx),1,"like",simLocal.Prototype);
-                    setTransportBlock(encodeDLSCH,trBlk,cwIdx-1,harqEntity.HARQProcessID);
+        harqEntity  = HARQEntity(0:pdschextra.NHARQProcesses-1, rvSeq, ...
+                                 pdsch.NumCodewords, maxNumCBG);
+        txStartSlot = nan(1, pdschextra.NHARQProcesses);
+        txCount     = zeros(1, pdschextra.NHARQProcesses);
+        nDelivered = 0; nLost = 0; sumTxDelivered = 0;
 
-                    txStartSlot(cwIdx,harqEntity.HARQProcessID+1) = nslot;
+        NSlots = simParameters.NFrames * carrier.SlotsPerFrame;
 
-                    if harqEntity.SequenceTimeout(cwIdx)
-                        resetSoftBuffer(decodeDLSCHLocal,cwIdx-1,harqEntity.HARQProcessID);
-                    end
+        estChannelGridAnts = getInitialChannelEstimate(carrier, channel, ...
+            simParameters.DataType, maxChDelay);
+        newWtx = hSVDPrecoders(carrier, pdsch, estChannelGridAnts, pdschextra.PRGBundleSize);
+        offset = 0;
+
+        SNR  = 10^(SNRdB/10);
+        N0   = 1/sqrt(simParameters.NRxAnts*waveformInfo.Nfft*SNR);
+        nVar = N0^2*waveformInfo.Nfft;
+
+        for nslot = 0:NSlots-1
+            carrier.NSlot = nslot;
+            [pdschIndices, pdschIndicesInfo] = nrPDSCHIndices(carrier, pdsch);
+            trBlkSize = nrTBS(pdsch.Modulation, pdsch.NumLayers, numel(pdsch.PRBSet), ...
+                pdschIndicesInfo.NREPerPRB, pdschextra.TargetCodeRate, pdschextra.XOverhead);
+
+            pid = harqEntity.HARQProcessID + 1;
+
+            % New transport block for this HARQ process
+            if harqEntity.NewData
+                trBlk = randi([0 1], trBlkSize, 1, "like", simParameters.Prototype);
+                setTransportBlock(encodeDLSCH, trBlk, 0, harqEntity.HARQProcessID);
+                txStartSlot(pid) = nslot;
+                if harqEntity.SequenceTimeout
+                    resetSoftBuffer(decodeDLSCH, 0, harqEntity.HARQProcessID);
                 end
             end
-        end
 
-        % Encode the DL-SCH transport blocks
-        codedTrBlocks = encodeDLSCH(pdsch.Modulation,pdsch.NumLayers, ...
-            pdschIndicesInfo.G,harqEntity.RedundancyVersion, ...
-            harqEntity.HARQProcessID,harqEntity.CBGTI);
+            % Transmit
+            codedTrBlock = encodeDLSCH(pdsch.Modulation, pdsch.NumLayers, ...
+                pdschIndicesInfo.G, harqEntity.RedundancyVersion, harqEntity.HARQProcessID);
 
-        % Get precoding matrix (wtx) calculated in previous slot
-        wtx = newWtx;
-        
-        % Create a resource grid for a slot
-        pdschGrid = nrResourceGrid(carrier,simLocal.NTxAnts,OutputDataType=simLocal.DataType,UseGPU=simLocal.UseGPU);
-        
-        % PDSCH modulation and precoding
-        pdschSymbols = nrPDSCH(carrier,pdsch,codedTrBlocks);
-        [pdschAntSymbols,pdschAntIndices] = nrPDSCHPrecode(carrier,pdschSymbols,pdschIndices,wtx);
-        
-        % PDSCH mapping in grid associated with PDSCH transmission period
-        pdschGrid(pdschAntIndices) = pdschAntSymbols;
-        
-        % PDSCH DM-RS precoding and mapping
-        dmrsSymbols = nrPDSCHDMRS(carrier,pdsch);
-        dmrsIndices = nrPDSCHDMRSIndices(carrier,pdsch);
-        [dmrsAntSymbols,dmrsAntIndices] = nrPDSCHPrecode(carrier,dmrsSymbols,dmrsIndices,wtx);
-        pdschGrid(dmrsAntIndices) = dmrsAntSymbols;
+            wtx = newWtx;
+            pdschGrid = nrResourceGrid(carrier, simParameters.NTxAnts, ...
+                OutputDataType=simParameters.DataType, UseGPU=simParameters.UseGPU);
+            pdschSymbols = nrPDSCH(carrier, pdsch, codedTrBlock);
+            [antSym, antInd] = nrPDSCHPrecode(carrier, pdschSymbols, pdschIndices, wtx);
+            pdschGrid(antInd) = antSym;
 
-        % PDSCH PT-RS precoding and mapping
-        ptrsSymbols = nrPDSCHPTRS(carrier,pdsch);
-        ptrsIndices = nrPDSCHPTRSIndices(carrier,pdsch);
-        [ptrsAntSymbols,ptrsAntIndices] = nrPDSCHPrecode(carrier,ptrsSymbols,ptrsIndices,wtx);
-        pdschGrid(ptrsAntIndices) = ptrsAntSymbols;
+            dmrsSymbols = nrPDSCHDMRS(carrier, pdsch);
+            dmrsIndices = nrPDSCHDMRSIndices(carrier, pdsch);
+            [antSym, antInd] = nrPDSCHPrecode(carrier, dmrsSymbols, dmrsIndices, wtx);
+            pdschGrid(antInd) = antSym;
 
-        % OFDM modulation
-        txWaveform = nrOFDMModulate(carrier,pdschGrid);
+            txWaveform = nrOFDMModulate(carrier, pdschGrid);
+            txWaveform = [txWaveform; zeros(maxChDelay, size(txWaveform,2))]; %#ok<AGROW>
+            [rxWaveform, ofdmResponse, timingOffset] = channel(txWaveform, carrier);
+            rxWaveform = rxWaveform + N0*randn(size(rxWaveform), "like", rxWaveform);
 
-        % Pass data through channel model. Append zeros at the end of the
-        % transmitted waveform to flush channel content. These zeros take
-        % into account any delay introduced in the channel. This is a mix
-        % of multipath delay and implementation delay. This value may 
-        % change depending on the sampling rate, delay profile, and delay
-        % spread. The channel model also returns the OFDM channel response
-        % and timing offset for the specified carrier
-        txWaveform = [txWaveform; zeros(maxChDelay,size(txWaveform,2))]; %#ok<AGROW>
-        [rxWaveform,ofdmResponse,timingOffset] = channel(txWaveform,carrier);
-
-        % Measure the received signal power at each Rx antenna. Average the
-        % power across Rx antennas and normalize by the number of allocated
-        % resource elements (REs). NRE counts the occupied REs in the
-        % transmitted OFDM resource grid. This measurement assumes that all
-        % physical channels and signals in the resource grid have the same
-        % average power per RE.
-        rxPowerAnt = rms(rxWaveform).^2;        
-        NRE = nnz(any(pdschGrid,3));
-        rxSigPower(nslot+1) = mean(rxPowerAnt)/NRE;
-
-        % Add AWGN to the received time domain waveform
-        noise = N0*randn(size(rxWaveform),"like",rxWaveform);
-        rxWaveform = rxWaveform + noise;
-
-        if (simLocal.PerfectChannelEstimator)
-            % For perfect synchronization, use the timing offset obtained
-            % from the channel
-            offset = timingOffset;
-        else
-            % Practical synchronization. Correlate the received waveform
-            % with the PDSCH DM-RS to give timing offset estimate 't' and
-            % correlation magnitude 'mag'. The function
-            % hSkipWeakTimingOffset is used to update the receiver timing
-            % offset. If the correlation peak in 'mag' is weak, the current
-            % timing estimate 't' is ignored and the previous estimate
-            % 'offset' is used
-            [t,mag] = nrTimingEstimate(carrier,rxWaveform,dmrsIndices,dmrsSymbols); 
-            offset = hSkipWeakTimingOffset(offset,t,mag);
-            % Display a warning if the estimated timing offset exceeds the
-            % maximum channel delay
-            if offset > maxChDelay
-                warning(['Estimated timing offset (%d) is greater than the maximum channel delay (%d).' ...
-                    ' This will result in a decoding failure. This may be caused by low SNR,' ...
-                    ' or not enough DM-RS symbols to synchronize successfully.'],offset,maxChDelay);
+            % Receive
+            if simParameters.PerfectChannelEstimator
+                offset = timingOffset;
+            else
+                [t, mag] = nrTimingEstimate(carrier, rxWaveform, dmrsIndices, dmrsSymbols);
+                offset = hSkipWeakTimingOffset(offset, t, mag);
             end
-        end
-        rxWaveform = rxWaveform(1+offset:end,:);
+            rxGrid = nrOFDMDemodulate(carrier, rxWaveform(1+offset:end,:));
+            [K, L, R] = size(rxGrid);
+            if L < carrier.SymbolsPerSlot
+                rxGrid = cat(2, rxGrid, zeros(K, carrier.SymbolsPerSlot-L, R));
+            end
 
-        % Perform OFDM demodulation on the received data to recreate the
-        % resource grid, including padding in the event that practical
-        % synchronization results in an incomplete slot being demodulated
-        rxGrid = nrOFDMDemodulate(carrier,rxWaveform);
-        [K,L,R] = size(rxGrid);
-        if (L < carrier.SymbolsPerSlot)
-            rxGrid = cat(2,rxGrid,zeros(K,carrier.SymbolsPerSlot-L,R));
-        end
+            if simParameters.PerfectChannelEstimator
+                estChannelGridAnts = ofdmResponse;
+                noiseEst = nVar;
+                estChannelGridPorts = precodeChannelEstimate(carrier, estChannelGridAnts, permute(wtx,[2 1 3]));
+            else
+                [estChannelGridPorts, noiseEst] = nrChannelEstimate(carrier, rxGrid, ...
+                    dmrsIndices, dmrsSymbols, "CDMLengths", pdsch.DMRS.CDMLengths);
+                noiseEst = mean(noiseEst, "all");
+                estChannelGridAnts = precodeChannelEstimate(carrier, estChannelGridPorts, conj(wtx));
+            end
+            [pdschRx, pdschHest] = nrExtractResources(pdschIndices, rxGrid, estChannelGridPorts);
+            [pdschEq, csi] = nrEqualizeMMSE(pdschRx, pdschHest, noiseEst);
 
-        if (simLocal.PerfectChannelEstimator)
-            % For perfect channel estimate, use the OFDM channel response
-            % obtained from the channel
-            estChannelGridAnts = ofdmResponse;
+            [dlschLLRs, rxSymbols] = nrPDSCHDecode(carrier, pdsch, pdschEq, noiseEst);
+            csi = nrLayerDemap(csi);
+            Qm = length(dlschLLRs{1}) / length(rxSymbols{1});
+            csi1 = repmat(csi{1}.', Qm, 1);
+            dlschLLRs{1} = dlschLLRs{1} .* csi1(:);
 
-            % Use the precalculated noise variance as the perfect noise
-            % estimate
-            noiseEst = nVar;
+            decodeDLSCH.TransportBlockLength = trBlkSize;
+            [~, blkerr] = decodeDLSCH(dlschLLRs, pdsch.Modulation, pdsch.NumLayers, ...
+                harqEntity.RedundancyVersion, harqEntity.HARQProcessID);
 
-            % Apply precoding to channel estimate and get PDSCH resource 
-            % elements from the received grid and channel estimate
-            estChannelGridPorts = precodeChannelEstimate(carrier,estChannelGridAnts,permute(wtx,[2 1 3]));
-            [pdschRx,pdschHest] = nrExtractResources(pdschIndices,rxGrid,estChannelGridPorts);
-        else
-            % Practical channel estimation between the received grid and
-            % each transmission layer, using the PDSCH DM-RS for each
-            % layer. This channel estimate includes the effect of
-            % transmitter precoding
-            [estChannelGridPorts,noiseEst] = nrChannelEstimate(carrier,rxGrid,dmrsIndices,dmrsSymbols,"PRGBundleSize",pdschextra.PRGBundleSize,"CDMLengths",pdsch.DMRS.CDMLengths); 
-
-            % Average noise estimate across PRGs and layers
-            noiseEst = mean(noiseEst,"all");
-
-            % Get PDSCH resource elements from the received grid and
-            % channel estimate
-            [pdschRx,pdschHest] = nrExtractResources(pdschIndices,rxGrid,estChannelGridPorts);
-
-            % Remove precoding from estChannelGridPorts to get channel
-            % estimate w.r.t. antennas
-            estChannelGridAnts = precodeChannelEstimate(carrier,estChannelGridPorts,conj(wtx));
-        end
-
-        % Equalization
-        [pdschEq,csi] = nrEqualizeMMSE(pdschRx,pdschHest,noiseEst);
-
-        % Common phase error (CPE) compensation
-        if ~isempty(ptrsIndices)
-            % Estimate CPE of OFDM symbols spanned by the first and
-            % last PT-RS OFDM symbols, inclusive.
-            [ptrsRx,ptrsHest] = nrExtractResources(ptrsIndices,rxGrid,estChannelGridPorts);
-            ptrsEq = nrEqualizeMMSE(ptrsRx,ptrsHest,noiseEst);
-            ptrsPorts = ceil(max(([1;double(ptrsIndices(:))]))/(carrier.NSizeGrid*12*carrier.SymbolsPerSlot));
-            cpe = nrPhaseNoiseEstimate(carrier,ptrsEq(:,ptrsPorts),ptrsIndices,ptrsSymbols);
-            % Compensate CPE
-            pdschEq = nrPhaseNoiseCompensate(carrier,pdschEq,pdschIndices,cpe);
-        end
-
-        % Decode PDSCH physical channel
-        [dlschLLRs,rxSymbols] = nrPDSCHDecode(carrier,pdsch,pdschEq,noiseEst);
-        
-        % Display EVM per layer, per slot and per RB
-        if (simLocal.DisplayDiagnostics)
-            plotLayerEVM(NSlots,nslot,pdsch,size(pdschGrid),pdschIndices,pdschSymbols,pdschEq);
-        end
-        
-        % Scale LLRs by CSI
-        csi = nrLayerDemap(csi); % CSI layer demapping
-        for cwIdx = 1:pdsch.NumCodewords
-            Qm = length(dlschLLRs{cwIdx})/length(rxSymbols{cwIdx}); % bits per symbol
-            csi{cwIdx} = repmat(csi{cwIdx}.',Qm,1);                 % expand by each bit per symbol
-            dlschLLRs{cwIdx} = dlschLLRs{cwIdx} .* csi{cwIdx}(:);   % scale by CSI
-        end
-        
-        % Decode the DL-SCH transport channel
-        decodeDLSCHLocal.TransportBlockLength = trBlkSizes;
-        [decbits,blkerr,cbgerr] = decodeDLSCHLocal(dlschLLRs, ...
-            pdsch.Modulation,pdsch.NumLayers,harqEntity.RedundancyVersion, ...
-            harqEntity.HARQProcessID,harqEntity.CBGTI);
-
-        currentHarqProcessID = harqEntity.HARQProcessID;
-        pid = currentHarqProcessID + 1;
-        for cwIdx = 1:pdsch.NumCodewords
-            txCount(cwIdx,pid) = txCount(cwIdx,pid) + 1;
-            if ~blkerr(cwIdx)                              % delivered
-                nDelivered = nDelivered + 1;
-                sumTxDelivered = sumTxDelivered + txCount(cwIdx,pid);
-                txCount(cwIdx,pid) = 0;
-            elseif txCount(cwIdx,pid) == numel(rvSeq)      % all attempts used: lost
+            % Bookkeeping: delivered / lost / latency (Eq. 1)
+            txCount(pid) = txCount(pid) + 1;
+            if ~blkerr
+                nDelivered     = nDelivered + 1;
+                sumTxDelivered = sumTxDelivered + txCount(pid);
+                sumLatencyMs(snrIdx) = sumLatencyMs(snrIdx) + ...
+                    (nslot - txStartSlot(pid) + 1) * slotDurationMs;
+                txCount(pid) = 0;
+                txStartSlot(pid) = NaN;
+            elseif txCount(pid) == Q2_NTX            % all attempts used: lost
                 nLost = nLost + 1;
-                txCount(cwIdx,pid) = 0;
+                txCount(pid) = 0;
+                txStartSlot(pid) = NaN;
             end
+
+            simThroughput(snrIdx) = simThroughput(snrIdx) + ~blkerr * trBlkSize;
+            maxThroughput(snrIdx) = maxThroughput(snrIdx) + trBlkSize;
+
+            updateAndAdvance(harqEntity, blkerr, trBlkSize, pdschIndicesInfo.G);
+            newWtx = hSVDPrecoders(carrier, pdsch, estChannelGridAnts, pdschextra.PRGBundleSize);
         end
 
-        for cwIdx = 1:pdsch.NumCodewords
-            if ~blkerr(cwIdx)
-                startSlot = txStartSlot(cwIdx,currentHarqProcessID+1);
-                if ~isnan(startSlot)
-                    simLatencyMs(snrIdx) = simLatencyMs(snrIdx) + ...
-                        (nslot - startSlot + 1) * slotDurationMs;
-                    numLatencyEvents(snrIdx) = numLatencyEvents(snrIdx) + 1;
-                    txStartSlot(cwIdx,currentHarqProcessID+1) = NaN;
-                end
-            end
+        nDeliveredAll(snrIdx) = nDelivered;
+        residualBLER(snrIdx)  = nLost / max(nDelivered + nLost, 1);
+        if nDelivered > 0
+            avgTx(snrIdx) = sumTxDelivered / nDelivered;
         end
-
-
-        % Store values to calculate throughput
-        simThroughput(snrIdx) = simThroughput(snrIdx) + sum(~blkerr .* trBlkSizes);
-        maxThroughput(snrIdx) = maxThroughput(snrIdx) + sum(trBlkSizes);
-
-        % Update current process with CRC error and advance to next process
-        procstatus = updateAndAdvance(harqEntity,blkerr,trBlkSizes,pdschIndicesInfo.G,cbgerr);
-        if (simLocal.DisplaySimulationInformation)
-            fprintf("\n(%3.2f%%) NSlot=%d, %s",100*(nslot+1)/NSlots,nslot,procstatus);
-        end
-
-        % Get precoding matrix for next slot
-        newWtx = hSVDPrecoders(carrier,pdsch,estChannelGridAnts,pdschextra.PRGBundleSize);
-
     end
 
-    % Calculate the noise power per RE and Rx antenna. This is constant
-    % across all slots.
-    noisePower = N0^2/(waveinfoLocal.Nfft*carrier.SymbolsPerSlot);
+    % Results for this modulation
+    lat = sumLatencyMs ./ max(nDeliveredAll, 1);
+    lat(nDeliveredAll == 0) = NaN;               % no delivered blocks: undefined
+    thrMbps = 1e-6 * simThroughput / (simParameters.NFrames * 10e-3);
 
-    % Since the received power varies over time due to channel effects,
-    % compute the average power across all slots to determine the average
-    % SNR per receive antenna and RE.
-    rxAntennaSNR(snrIdx) = pow2db(mean(rxSigPower)./noisePower);
+    latencyAll(:,mIdx)    = lat;
+    throughputAll(:,mIdx) = thrMbps;
+    throughputPct(:,mIdx) = 100 * simThroughput ./ maxThroughput;
+    residualAll(:,mIdx)   = residualBLER;
+    avgTxAll(:,mIdx)      = avgTx;
 
-    % Display the results dynamically in the command window
-    if (simLocal.DisplaySimulationInformation)
-        fprintf("\n");
-    end
-    fprintf("\nThroughput(Mbps) for %d frame(s) = %.4f\n",simLocal.NFrames,1e-6*simThroughput(snrIdx)/(simLocal.NFrames*10e-3));
-    fprintf("Throughput(%%) for %d frame(s) = %.4f\n",simLocal.NFrames,simThroughput(snrIdx)*100/maxThroughput(snrIdx));
-    residualBLER(snrIdx) = nLost / (nDelivered + nLost);   
-    avgTx(snrIdx) = sumTxDelivered / nDelivered;           
-    fprintf("Residual BLER = %.3f, avg transmissions per delivered block = %.2f\n", residualBLER(snrIdx), avgTx(snrIdx));
-     
+    plot(axLat, simParameters.SNRIn, lat,     "o-", "DisplayName", modulation, "LineWidth", 1.5);
+    plot(axThr, simParameters.SNRIn, thrMbps, "o-", "DisplayName", modulation, "LineWidth", 1.5);
 end
 
-
-
-
-%% Results
-avgLatencyMs = simLatencyMs ./ max(numLatencyEvents,1);
-avgLatencyMs(numLatencyEvents == 0) = NaN;
-
-throughputMbps = 1e-6*simThroughput./(simParameters.NFrames*10e-3);
-
-% Store for saving later
-latencyAll(:,index)    = avgLatencyMs;
-throughputAll(:,index) = throughputMbps;
-throughputPct(:,index) = 100*simThroughput./maxThroughput;
-residualAll(:,index) = residualBLER;
-avgTxAll(:,index)    = avgTx;
-
-% Latency plot
-plot(axLat,simParameters.SNRIn,avgLatencyMs,"o-.","DisplayName",modulation, "LineWidth",2,"MarkerSize",8);
-
-% Throughput plot
-plot(axThr,simParameters.SNRIn,throughputMbps,"o-.","DisplayName",modulation,"LineWidth",2,"MarkerSize",8);
-
-simResults = struct();
-simResults.simParameters = simParameters;
-simResults.simThroughput = simThroughput;
-simResults.maxThroughput = maxThroughput;
-simResults.rxAntennaSNR = rxAntennaSNR;
-
-
-summaryTable = processResults(simResults);
-end   % end of modulation loop
-
-
-%%
-% Display a table that contains the measured throughput and SNR. The SNRIn
-% column refers to the target average SNR specified in the simulation. The
-% Rx Antenna SNR column refers to the average SNR per receive antenna and
-% RE measured at the output of the channel. The measured SNR includes
-% effects caused by the channel and MIMO precoding. For an explanation of
-% the SNR definition that this example uses, see
-% <docid:5g_ug#mw_37cef3ca-2f4b-433d-8d68-117a881ca5fd SNR Definition Used
-% in Link Simulations>.
-titleStr = sprintf("%s (%dx%d) / NRB=%d / SCS=%dkHz", ...
-    simParameters.DelayProfile,simParameters.NTxAnts,simParameters.NRxAnts, ...
-    simParameters.Carrier.NSizeGrid,simParameters.Carrier.SubcarrierSpacing);
-
-% Format latency plot
-hold(axLat,"off");
-xlabel(axLat,"SNR (dB)"); ylabel(axLat,"Average latency (ms)");
+%% Plots and data
+titleStr = sprintf("Q2 %s (%s), 1x1, N_{tx} = %d", Q2_ENV, simParameters.DelayProfile, Q2_NTX);
+hold(axLat,"off"); xlabel(axLat,"SNR (dB)"); ylabel(axLat,"Mean latency (ms)");
 grid(axLat,"on"); title(axLat,titleStr); legend(axLat,"Location","best");
-
-% Format throughput plot
-hold(axThr,"off");
-xlabel(axThr,"SNR (dB)"); ylabel(axThr,"Throughput (Mbps)");
+hold(axThr,"off"); xlabel(axThr,"SNR (dB)"); ylabel(axThr,"Throughput (Mbit/s)");
 grid(axThr,"on"); title(axThr,titleStr); legend(axThr,"Location","best");
 
-disp(summaryTable);   % summary of the last modulation (256QAM)
+if ~exist("Q2img","dir"),  mkdir("Q2img");  end
+if ~exist("Q2data","dir"), mkdir("Q2data"); end
+exportgraphics(figLat, sprintf("Q2img/latency_%s_ntx%d.png",    Q2_ENV, Q2_NTX), "Resolution", 300);
+exportgraphics(figThr, sprintf("Q2img/throughput_%s_ntx%d.png", Q2_ENV, Q2_NTX), "Resolution", 300);
 
-%% Save plots and data
-if ~exist('Q2img','dir'),  mkdir('Q2img');  end
-if ~exist('Q2data','dir'), mkdir('Q2data'); end
-
-
-% Images
-exportgraphics(figLat,sprintf('Q2img/latency_ntx%d.png',Q2_NTX),'Resolution',300);
-exportgraphics(figThr,sprintf('Q2img/throughput_ntx%d.png',Q2_NTX),'Resolution',300);
-
-% Raw data (one column per modulation)
 snr = simParameters.SNRIn(:);
-latencyTbl = array2table([snr latencyAll], ...
-    'VariableNames',["SNRdB" "Latency_"+modulationlist]);
-throughputTbl = array2table([snr throughputAll throughputPct], ...
-    'VariableNames',["SNRdB" "Throughput_Mbps_"+modulationlist "Throughput_pct_"+modulationlist]);
+T = array2table([snr latencyAll throughputAll throughputPct residualAll avgTxAll], ...
+    "VariableNames", ["SNRdB" "Latency_ms_"+modulationlist "Thr_Mbps_"+modulationlist ...
+    "Thr_pct_"+modulationlist "ResBLER_"+modulationlist "AvgTx_"+modulationlist]);
+writetable(T, sprintf("Q2data/Q2_%s_ntx%d.csv", Q2_ENV, Q2_NTX));
 
-
-% Plot image
-% Optional: save editable figure
-%savefig(fig, 'Q2img/latencyPlot.fig')
-
-
-%%
-% The figure below shows throughput results obtained simulating 10000
-% subframes (|NFrames = 1000|, |SNRIn = -18:2:16|).
-%
-% <<../longRunThroughput.png>>
-%
-
-%% References
-% [1] 3GPP TS 38.211. "NR; Physical channels and modulation."
-% _3rd Generation Partnership Project; Technical Specification Group Radio
-% Access Network_.
-%
-% [2] 3GPP TS 38.212. "NR; Multiplexing and channel coding." 
-% _3rd Generation Partnership Project; Technical Specification Group Radio
-% Access Network_.
-%
-% [3] 3GPP TS 38.213. "NR; Physical layer procedures for control." 
-% _3rd Generation Partnership Project; Technical Specification Group Radio
-% Access Network_.
-%
-% [4] 3GPP TS 38.214. "NR; Physical layer procedures for data."
-% _3rd Generation Partnership Project; Technical Specification Group Radio
-% Access Network_.
-%
-% [5] 3GPP TR 38.901. "Study on channel model for frequencies from 0.5 to 100
-% GHz."
-% _3rd Generation Partnership Project; Technical Specification Group Radio
-% Access Network_.
-
-%% Local Functions
-
-function summaryTable = processResults(results)
-% Create a simulation results table
-
-    NFrames = results.simParameters.NFrames;
-    SNRIn = results.simParameters.SNRIn;
-   
-    totalBits = results.maxThroughput;
-    correctBits = results.simThroughput;
-    
-    throughputMbps = round(1e-6*correctBits/(NFrames*10e-3),2);
-    throughput = round(100*(correctBits./totalBits),2);
-    
-    bler = 100 - throughput;
-    SNRout = round(results.rxAntennaSNR,1);
-    summaryTable = table(SNRIn.',throughput,throughputMbps,bler,SNRout);
-
-    summaryTable.Properties.VariableNames = ["SNRIn" "Throughput (%)" "Throughput (Mbps)" "BLER (%)" "Rx Antenna SNR"];
-
-end
-
-function validateNumLayers(simParameters)
-% Validate the number of layers, relative to the antenna geometry
-
-    numlayers = simParameters.PDSCH.NumLayers;
-    ntxants = simParameters.NTxAnts;
-    nrxants = simParameters.NRxAnts;
-    antennaDescription = sprintf("min(NTxAnts,NRxAnts) = min(%d,%d) = %d",ntxants,nrxants,min(ntxants,nrxants));
-    if numlayers > min(ntxants,nrxants)
-        error("The number of layers (%d) must satisfy NumLayers <= %s", ...
-            numlayers,antennaDescription);
-    end
-    
-    % Display a warning if the maximum possible rank of the channel equals
-    % the number of layers
-    if (numlayers > 2) && (numlayers == min(ntxants,nrxants))
-        warning(['The maximum possible rank of the channel, given by %s, is equal to NumLayers (%d).' ...
-            ' This may result in a decoding failure under some channel conditions.' ...
-            ' Try decreasing the number of layers or increasing the channel rank' ...
-            ' (use more transmit or receive antennas).'],antennaDescription,numlayers); %#ok<SPWRN>
-    end
-
-end
-
-function estChannelGrid = getInitialChannelEstimate(carrier,propchannel,dataType,maxChDelay)
-% Obtain channel estimate before first transmission. This can be used to
-% obtain a precoding matrix for the first slot.
-
+%% Local functions
+function estChannelGrid = getInitialChannelEstimate(carrier, propchannel, dataType, maxChDelay)
     ofdmInfo = nrOFDMInfo(carrier);
-
-    % Clone of the channel
     chClone = propchannel.clone();
     chClone.release();
-
-    % No filtering needed to get perfect channel estimate
     chClone.ChannelFiltering = false;
     chClone.OutputDataType = dataType;
-    if ~strcmp(chClone.DelayProfile,"None")
-        chClone.NumTimeSamples = (ofdmInfo.SampleRate/1000/carrier.SlotsPerSubframe)+maxChDelay;
-    end
-
-    % Get the perfect channel estimate
+    chClone.NumTimeSamples = (ofdmInfo.SampleRate/1000/carrier.SlotsPerSubframe) + maxChDelay;
     estChannelGrid = chClone(carrier);
-    
 end
 
-function estChannelGrid = precodeChannelEstimate(carrier,estChannelGrid,W)
-% Apply precoding matrix W to the last dimension of the channel estimate
-
-    [K,L,R,P] = size(estChannelGrid);
-    estChannelGrid = reshape(estChannelGrid,[K*L R P]);
-    estChannelGrid = nrPDSCHPrecode(carrier,estChannelGrid,reshape(1:numel(estChannelGrid),[K*L R P]),W);
-    estChannelGrid = reshape(estChannelGrid,K,L,R,[]);
-
+function estChannelGrid = precodeChannelEstimate(carrier, estChannelGrid, W)
+    [K, L, R, P] = size(estChannelGrid);
+    estChannelGrid = reshape(estChannelGrid, [K*L R P]);
+    estChannelGrid = nrPDSCHPrecode(carrier, estChannelGrid, reshape(1:numel(estChannelGrid), [K*L R P]), W);
+    estChannelGrid = reshape(estChannelGrid, K, L, R, []);
 end
 
-function plotLayerEVM(NSlots,nslot,pdsch,siz,pdschIndices,pdschSymbols,pdschEq)
-% Plot EVM information
-
-    persistent slotEVM;
-    persistent rbEVM
-    persistent evmPerSlot;
-    
-    if (nslot==0)
-        slotEVM = comm.EVM;
-        rbEVM = comm.EVM;
-        evmPerSlot = NaN(NSlots,pdsch.NumLayers);
-        figure;
-    end
-    evmPerSlot(nslot+1,:) = slotEVM(pdschSymbols,pdschEq);
-    subplot(2,1,1);
-    plot(0:(NSlots-1),evmPerSlot,"o=","LineWidth", 12, "MarkerSize", 20);
-    xlabel("Slot number");
-    ylabel("EVM (%)");
-    legend("layer " + (1:pdsch.NumLayers),"Location","EastOutside");
-    title("EVM per layer per slot");
-
-    subplot(2,1,2);
-    [k,~,p] = ind2sub(siz,pdschIndices);
-    rbsubs = floor((k-1) / 12);
-    NRB = siz(1) / 12;
-    evmPerRB = NaN(NRB,pdsch.NumLayers);
-    for nu = 1:pdsch.NumLayers
-        for rb = unique(rbsubs).'
-            this = (rbsubs==rb & p==nu);
-            evmPerRB(rb+1,nu) = rbEVM(pdschSymbols(this),pdschEq(this));
-        end
-    end
-
-   
-    xlabel("SNR (dB)");
-    ylabel("Average latency (ms)");
-    grid on;
-    title(sprintf("%s (%dx%d) / NRB=%d / SCS=%dkHz", ...
-        simParameters.DelayProfile,simParameters.NTxAnts,simParameters.NRxAnts, ...
-        simParameters.Carrier.NSizeGrid,simParameters.Carrier.SubcarrierSpacing));
-    
-    drawnow;
-    
-end
-
-function [channel,simParameters] = createChannel(simParameters,waveformInfo)
-
-    % Construct the CDL or TDL channel model object
-    if contains(simParameters.DelayProfile,"CDL","IgnoreCase",true) || ...
-            strcmpi(simParameters.DelayProfile,"None")
-    
-        channel = nrCDLChannel; % CDL channel object
-        
-        % Turn the number of antennas into antenna panel array layouts. If
-        % NTxAnts is not one of (1,2,4,8,16,32,64,128,256,512,1024), its value
-        % is rounded up to the nearest value in the set. If NRxAnts is not 1 or
-        % even, its value is rounded up to the nearest even number.
-        channel = hArrayGeometry(channel,simParameters.NTxAnts,simParameters.NRxAnts);
-        simParameters.NTxAnts = prod(channel.TransmitAntennaArray.Size);
-        simParameters.NRxAnts = prod(channel.ReceiveAntennaArray.Size);
-    
-    else
-    
-        channel = nrTDLChannel; % TDL channel object
-    
-        % Configure the channel to automatically select a sample rate for
-        % generating channel coefficients
-        channel.PathGainSampleRate = "auto";
-        
-        % Set the channel geometry
-        channel.NumTransmitAntennas = simParameters.NTxAnts;
-        channel.NumReceiveAntennas = simParameters.NRxAnts;
-    
-    end
-    
-    % Assign simulation channel parameters and waveform sample rate to the
-    % object, and specify OFDM channel response as the channel response output
-    % so that perfect channel estimation is calculated while filtering the
-    % signal
-    channel.DelayProfile = simParameters.DelayProfile;
-    if ~strcmp(channel.DelayProfile,"None")
-        channel.DelaySpread = simParameters.DelaySpread;
-        channel.MaximumDopplerShift = simParameters.MaximumDopplerShift;
-        channel.SampleRate = waveformInfo.SampleRate;
-    end
+function [channel, simParameters] = createChannel(simParameters, waveformInfo)
+    channel = nrTDLChannel;
+    channel.PathGainSampleRate  = "auto";
+    channel.NumTransmitAntennas = simParameters.NTxAnts;
+    channel.NumReceiveAntennas  = simParameters.NRxAnts;
+    channel.DelayProfile        = simParameters.DelayProfile;
+    channel.DelaySpread         = simParameters.DelaySpread;
+    channel.MaximumDopplerShift = simParameters.MaximumDopplerShift;
+    channel.SampleRate          = waveformInfo.SampleRate;
     channel.ChannelResponseOutput = "ofdm-response";
-
 end

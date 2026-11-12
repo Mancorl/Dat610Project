@@ -10,7 +10,6 @@
 % simulation time, you can use Parallel Computing Toolbox(TM) to execute 
 % the SNR points in the SNR loop in parallel and use a compatible
 % graphics processing unit (GPU) device for data-intensive computation.
-clear; clc;
 % Copyright 2017-2026 The MathWorks, Inc.
 
 %% Introduction
@@ -62,8 +61,8 @@ clear; clc;
 % uses, see <docid:5g_ug#mw_37cef3ca-2f4b-433d-8d68-117a881ca5fd SNR
 % Definition used in Link Simulations>.
 simParameters = struct();       % Clear simParameters variable to contain all key simulation parameters 
-simParameters.NFrames = 10;      % Number of 10 ms frames
-simParameters.SNRIn = [-20 -19 -18 -17 -16 -15 -14 -13 -12 -11 -10 -9 -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6]; % SNR range (dB)
+simParameters.NFrames = 100;      % Number of 10 ms frames
+simParameters.SNRIn = -20:2:30; % SNR range (dB)
 
 numSNRPoints  = numel(simParameters.SNRIn);
 
@@ -92,9 +91,7 @@ simParameters.PerfectChannelEstimator = true;
 % simulation information such as the HARQ process ID used for each
 % subframe. In case of CRC error, the value of the index to the RV sequence
 % is also displayed.
-
-simParameters.DisplaySimulationInformation = true;
-
+simParameters.DisplaySimulationInformation = false;
 %%
 % The |DisplayDiagnostics| flag enables the plotting of the EVM per layer.
 % This plot monitors the quality of the received signal after equalization.
@@ -181,6 +178,8 @@ figThr = figure; axThr = axes(figThr); hold(axThr,"on");
 latencyAll    = nan(numSNRPoints,numel(modulationlist));
 throughputAll = nan(numSNRPoints,numel(modulationlist));   % Mbps
 throughputPct = nan(numSNRPoints,numel(modulationlist));   % %
+residualAll = nan(numSNRPoints,numel(modulationlist));
+avgTxAll    = nan(numSNRPoints,numel(modulationlist));
 
 for index = 1:numel(modulationlist)
     simThroughput = zeros(numSNRPoints,1);
@@ -345,18 +344,14 @@ slotDurationMs = 1 / simParameters.Carrier.SlotsPerSubframe;
 % Array to store measured SNR for all SNR points
 rxAntennaSNR = zeros(numSNRPoints,1);
 
+residualBLER = zeros(numSNRPoints,1);   % blocks lost after all allowed transmissions / finished blocks
+avgTx = zeros(numSNRPoints,1);          % average transmissions per delivered block
+
 % Set up redundancy version (RV) sequence for all HARQ processes
-if simParameters.PDSCHExtension.EnableHARQ
-    % In the final report of RAN WG1 meeting #91 (R1-1719301), it was
-    % observed in R1-1717405 that if performance is the priority, [0 2 3 1]
-    % should be used. If self-decodability is the priority, it should be
-    % taken into account that the upper limit of the code rate at which
-    % each RV is self-decodable is in the following order: 0>3>2>1
-    rvSeq = repmat([0 2 3 1],1,3);
-else
-    % HARQ disabled - single transmission with RV=0, no retransmissions
-    rvSeq = 0;
-end
+% In Q2 script: replace the if/else that sets rvSeq
+baseRV = [0 2 3 1];
+rvSeq  = baseRV(mod(0:Q2_NTX-1, 4) + 1);   % Q2_NTX = max number of transmissions
+simParameters.PDSCHExtension.EnableHARQ = (Q2_NTX > 1);
 
 % Set up maximum number of CBGs in retransmissions
 if simParameters.PDSCHExtension.EnableCBGTransmission
@@ -418,7 +413,8 @@ for snrIdx = 1:numSNRPoints      % comment out for parallel computing
 
     % Initialize the state of all HARQ processes
     harqEntity = HARQEntity(harqSequence,rvSeq,pdsch.NumCodewords,maxNumCBG);
-        
+    txCount = zeros(pdsch.NumCodewords, pdschextra.NHARQProcesses);
+    nDelivered = 0; nLost = 0; sumTxDelivered = 0;
     % Reset the channel so that each SNR point will experience the same
     % channel realization
     reset(channel);
@@ -634,6 +630,18 @@ for snrIdx = 1:numSNRPoints      % comment out for parallel computing
             harqEntity.HARQProcessID,harqEntity.CBGTI);
 
         currentHarqProcessID = harqEntity.HARQProcessID;
+        pid = currentHarqProcessID + 1;
+        for cwIdx = 1:pdsch.NumCodewords
+            txCount(cwIdx,pid) = txCount(cwIdx,pid) + 1;
+            if ~blkerr(cwIdx)                              % delivered
+                nDelivered = nDelivered + 1;
+                sumTxDelivered = sumTxDelivered + txCount(cwIdx,pid);
+                txCount(cwIdx,pid) = 0;
+            elseif txCount(cwIdx,pid) == numel(rvSeq)      % all attempts used: lost
+                nLost = nLost + 1;
+                txCount(cwIdx,pid) = 0;
+            end
+        end
 
         for cwIdx = 1:pdsch.NumCodewords
             if ~blkerr(cwIdx)
@@ -678,8 +686,13 @@ for snrIdx = 1:numSNRPoints      % comment out for parallel computing
     end
     fprintf("\nThroughput(Mbps) for %d frame(s) = %.4f\n",simLocal.NFrames,1e-6*simThroughput(snrIdx)/(simLocal.NFrames*10e-3));
     fprintf("Throughput(%%) for %d frame(s) = %.4f\n",simLocal.NFrames,simThroughput(snrIdx)*100/maxThroughput(snrIdx));
+    residualBLER(snrIdx) = nLost / (nDelivered + nLost);   
+    avgTx(snrIdx) = sumTxDelivered / nDelivered;           
+    fprintf("Residual BLER = %.3f, avg transmissions per delivered block = %.2f\n", residualBLER(snrIdx), avgTx(snrIdx));
      
 end
+
+
 
 
 %% Results
@@ -692,18 +705,21 @@ throughputMbps = 1e-6*simThroughput./(simParameters.NFrames*10e-3);
 latencyAll(:,index)    = avgLatencyMs;
 throughputAll(:,index) = throughputMbps;
 throughputPct(:,index) = 100*simThroughput./maxThroughput;
+residualAll(:,index) = residualBLER;
+avgTxAll(:,index)    = avgTx;
 
 % Latency plot
-plot(axLat,simParameters.SNRIn,avgLatencyMs,"o-.","DisplayName",modulation);
+plot(axLat,simParameters.SNRIn,avgLatencyMs,"o-.","DisplayName",modulation, "LineWidth",2,"MarkerSize",8);
 
 % Throughput plot
-plot(axThr,simParameters.SNRIn,throughputMbps,"o-.","DisplayName",modulation);
+plot(axThr,simParameters.SNRIn,throughputMbps,"o-.","DisplayName",modulation,"LineWidth",2,"MarkerSize",8);
 
 simResults = struct();
 simResults.simParameters = simParameters;
 simResults.simThroughput = simThroughput;
 simResults.maxThroughput = maxThroughput;
 simResults.rxAntennaSNR = rxAntennaSNR;
+
 
 summaryTable = processResults(simResults);
 end   % end of modulation loop
@@ -738,13 +754,10 @@ disp(summaryTable);   % summary of the last modulation (256QAM)
 if ~exist('Q2img','dir'),  mkdir('Q2img');  end
 if ~exist('Q2data','dir'), mkdir('Q2data'); end
 
-% Editable figures
-savefig(figLat,'Q2img/latencyPlot.fig');
-savefig(figThr,'Q2img/throughputPlot.fig');
 
 % Images
-exportgraphics(figLat,'Q2img/latencyPlot.png','Resolution',300);
-exportgraphics(figThr,'Q2img/throughputPlot.png','Resolution',300);
+exportgraphics(figLat,sprintf('Q2img/latency_ntx%d.png',Q2_NTX),'Resolution',300);
+exportgraphics(figThr,sprintf('Q2img/throughput_ntx%d.png',Q2_NTX),'Resolution',300);
 
 % Raw data (one column per modulation)
 snr = simParameters.SNRIn(:);
@@ -753,9 +766,6 @@ latencyTbl = array2table([snr latencyAll], ...
 throughputTbl = array2table([snr throughputAll throughputPct], ...
     'VariableNames',["SNRdB" "Throughput_Mbps_"+modulationlist "Throughput_pct_"+modulationlist]);
 
-writetable(latencyTbl,'Q2data/latencyData.csv');
-writetable(throughputTbl,'Q2data/throughputData.csv');
-save('Q2data/simData.mat','latencyTbl','throughputTbl','simParameters');
 
 % Plot image
 % Optional: save editable figure
@@ -883,7 +893,7 @@ function plotLayerEVM(NSlots,nslot,pdsch,siz,pdschIndices,pdschSymbols,pdschEq)
     end
     evmPerSlot(nslot+1,:) = slotEVM(pdschSymbols,pdschEq);
     subplot(2,1,1);
-    plot(0:(NSlots-1),evmPerSlot,"o-");
+    plot(0:(NSlots-1),evmPerSlot,"o=","LineWidth", 12, "MarkerSize", 20);
     xlabel("Slot number");
     ylabel("EVM (%)");
     legend("layer " + (1:pdsch.NumLayers),"Location","EastOutside");
